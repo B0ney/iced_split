@@ -5,6 +5,7 @@ use iced_core::{
     Vector, Widget,
     border::{self, Radius},
     layout::{Limits, Node},
+    length::{Bounds, Constraint},
     mouse::{self, Click, Cursor, Interaction, click::Kind},
     overlay,
     renderer::{self, Quad},
@@ -316,11 +317,10 @@ where
         self
     }
 
-    fn hovering(&self, bounds: Rectangle, cursor: Cursor) -> Status {
-        let (cross_direction, layout_direction) =
-            self.direction.select(bounds.width, bounds.height);
+    fn hovering(&self, bounds: Rectangle, cursor: Cursor, state: &State) -> Status {
+        let cross_direction = self.direction.select(bounds.width, bounds.height).0;
 
-        let layout = self.start_layout(layout_direction) + self.spacing;
+        let layout = state.start_layout + self.spacing;
         let (x, y) = self.direction.select(0.0, layout);
         let (x, y) = (x + bounds.x, y + bounds.y);
         let (width, height) = self.direction.select(cross_direction, self.handle_width);
@@ -344,17 +344,6 @@ where
     fn separation(&self) -> f32 {
         2.0 * self.spacing + self.handle_width
     }
-
-    fn start_layout(&self, layout_direction: f32) -> f32 {
-        let separation = self.separation();
-        match self.strategy {
-            Strategy::Relative => layout_direction * self.split_at - separation / 2.0,
-            Strategy::Start => self.split_at,
-            Strategy::End => layout_direction - self.split_at - separation,
-        }
-        .min(layout_direction - separation)
-        .max(0.0)
-    }
 }
 
 #[derive(PartialEq)]
@@ -369,6 +358,7 @@ enum Status {
 struct State {
     status: Status,
     last_click: Option<Click>,
+    start_layout: f32,
     mix: Animation<bool>,
     now: Instant,
     duration: Duration,
@@ -380,6 +370,7 @@ impl State {
         Self {
             status: Status::None,
             last_click: None,
+            start_layout: 0.0,
             mix: Animation::new(false).duration(duration).delay(delay),
             now: Instant::now(),
             duration,
@@ -422,21 +413,53 @@ where
     }
 
     fn layout(&mut self, tree: &mut Tree, renderer: &Renderer, limits: &Limits) -> Node {
-        let max_limits = limits.max();
+        let start_size = self.children[0].as_widget().size();
+        let start_min = match self.direction.select(start_size.width, start_size.height).1 {
+            Length::Fixed(min)
+            | Length::Bounded {
+                bounds: Bounds::Min(min) | Bounds::Both { min, .. },
+                ..
+            }
+            | Length::Fluid(Constraint::Min(min)) => min,
+            _ => 0.0,
+        };
 
+        let end_size = self.children[1].as_widget().size();
+        let end_min = match self.direction.select(end_size.width, end_size.height).1 {
+            Length::Fixed(min)
+            | Length::Bounded {
+                bounds: Bounds::Min(min) | Bounds::Both { min, .. },
+                ..
+            }
+            | Length::Fluid(Constraint::Min(min)) => min,
+            _ => 0.0,
+        };
+
+        let max_limits = limits.max();
         let (cross_direction, layout_direction) =
             self.direction.select(max_limits.width, max_limits.height);
 
-        let start_layout = self.start_layout(layout_direction);
-        let (start_width, start_height) = self.direction.select(cross_direction, start_layout);
+        let separation = self.separation();
+        let state = tree.state.downcast_mut::<State>();
+        state.start_layout = match self.strategy {
+            Strategy::Relative => layout_direction * self.split_at - separation / 2.0,
+            Strategy::Start => self.split_at,
+            Strategy::End => layout_direction - self.split_at - separation,
+        }
+        .min(layout_direction - separation - end_min)
+        .max(start_min);
+
+        let (start_width, start_height) =
+            self.direction.select(cross_direction, state.start_layout);
         let start_limits = Limits::new(Size::ZERO, Size::new(start_width, start_height));
 
         let separation = self.separation();
-        let end_layout = layout_direction - start_layout - separation;
+        let end_layout = layout_direction - state.start_layout - separation;
         let (end_width, end_height) = self.direction.select(cross_direction, end_layout);
         let end_limits = Limits::new(Size::ZERO, Size::new(end_width, end_height));
 
-        let (offset_width, offset_height) = self.direction.select(0.0, start_layout + separation);
+        let (offset_width, offset_height) =
+            self.direction.select(0.0, state.start_layout + separation);
 
         let children = vec![
             self.children[0]
@@ -515,14 +538,13 @@ where
                         )
                     {
                         let layout_direction = self.direction.select(bounds.width, bounds.height).1;
-
-                        let layout = self.direction.select(x - bounds.x, y - bounds.y).1;
+                        let split_at = self.direction.select(x - bounds.x, y - bounds.y).1;
 
                         let separation = self.separation();
                         let split_at = match self.strategy {
-                            Strategy::Relative => layout / layout_direction,
-                            Strategy::Start => layout - separation / 2.0,
-                            Strategy::End => layout_direction - layout - separation / 2.0,
+                            Strategy::Relative => split_at / layout_direction,
+                            Strategy::Start => split_at - separation / 2.0,
+                            Strategy::End => layout_direction - split_at - separation / 2.0,
                         };
 
                         if split_at != self.split_at {
@@ -538,9 +560,7 @@ where
                         }
                     } else {
                         let focused = self.focused(state);
-
-                        state.status = self.hovering(bounds, cursor);
-
+                        state.status = self.hovering(bounds, cursor, state);
                         if self.focused(state) != focused {
                             shell.request_redraw();
                         }
@@ -554,9 +574,7 @@ where
                         }
 
                         let focused = self.focused(state);
-
-                        state.status = self.hovering(bounds, cursor);
-
+                        state.status = self.hovering(bounds, cursor, state);
                         if self.focused(state) != focused {
                             shell.request_redraw();
                         }
@@ -632,11 +650,8 @@ where
         };
 
         let bounds = layout.bounds();
-        let (cross_direction, layout_direction) =
-            self.direction.select(bounds.width, bounds.height);
-
-        let layout = self.start_layout(layout_direction);
-        let layout = layout + self.spacing + (self.handle_width - width) / 2.0;
+        let cross_direction = self.direction.select(bounds.width, bounds.height).0;
+        let layout = state.start_layout + self.spacing + (self.handle_width - width) / 2.0;
         let (x, y) = self.direction.select(0.0, layout);
         let (x, y) = (x + bounds.x, y + bounds.y);
         let (width, height) = self.direction.select(cross_direction, width);
